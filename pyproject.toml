@@ -10,14 +10,14 @@ authors = [
     { name = "Topaz Bott", email = "topaz@topazhome.net" },
 ]
 description = "A private PyPI server backed by AWS S3, API Gateway, and CloudFront"
-
-[project.urls]
-Homepage = "https://github.com/tmb28054/S3-Pypi-Server"
-Repository = "https://github.com/tmb28054/S3-Pypi-Server"
 requires-python = ">=3.10"
 dependencies = [
     "boto3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/tmb28054/S3-Pypi-Server"
+Repository = "https://github.com/tmb28054/S3-Pypi-Server"
 
 [project.optional-dependencies]
 test = [
