@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "s3-pypi-server"
+version = "0.2.0"
+license = "MIT"
+authors = [
+    { name = "Topaz Bott", email = "topaz@topazhome.net" },
+]
+description = "A private PyPI server backed by AWS S3, API Gateway, and CloudFront"
+
+[project.urls]
+Homepage = "https://github.com/tmb28054/S3-Pypi-Server"
+Repository = "https://github.com/tmb28054/S3-Pypi-Server"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-cov",
+    "hypothesis",
+    "moto",
+    "pylint",
+    "bandit",
+]
+
+[project.scripts]
+s3pypi = "s3pypi.cli:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "smoke: fast smoke tests with no external dependencies",
+]

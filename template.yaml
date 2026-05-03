@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Private PyPI server using S3 for storage, API Gateway as the HTTP front-end,
+  and CloudFront as a caching layer.
+
+Parameters:
+  StackNamePrefix:
+    Type: String
+    Default: s3-pypi
+    Description: Prefix used for naming resources in this stack.
+  CacheTTL:
+    Type: Number
+    Default: 300
+    Description: CloudFront default cache TTL in seconds.
+  DomainName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional custom domain name for CloudFront (e.g. pypi.example.org).
+      Leave empty to use the default CloudFront domain.
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional ACM certificate ARN for the custom domain.
+      Required when DomainName is provided.
+
+Conditions:
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref DomainName, ""]]
+    - !Not [!Equals [!Ref AcmCertificateArn, ""]]
+
+Resources:
+  # ---------------------------------------------------------------
+  # S3 Bucket — package storage
+  # ---------------------------------------------------------------
+  PyPIBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${StackNamePrefix}-pypi-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-pypi-bucket"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+
+  # ---------------------------------------------------------------
+  # IAM Role — allows API Gateway to read from the S3 bucket
+  # ---------------------------------------------------------------
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-api-role"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${PyPIBucket}/*"
+
+  # ---------------------------------------------------------------
+  # API Gateway — REST API
+  # ---------------------------------------------------------------
+  PyPIApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${StackNamePrefix}-api"
+      Description: PyPI Simple Repository API backed by S3
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-api"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+      BinaryMediaTypes:
+        - "application/octet-stream"
+        - "application/zip"
+        - "application/gzip"
+        - "application/x-tar"
+        - "application/x-gzip"
+
+  # --- /simple/ resource ---
+  SimpleResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ParentId: !GetAtt PyPIApi.RootResourceId
+      PathPart: simple
+
+  # GET /simple/  →  S3 simple/index.html
+  SimpleGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ResourceId: !Ref SimpleResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Content-Type: true
+        - StatusCode: "404"
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: GET
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${PyPIBucket}/simple/index.html"
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Content-Type: "'text/html'"
+          - StatusCode: "404"
+            SelectionPattern: "404"
+        PassthroughBehavior: WHEN_NO_MATCH
+
+  # --- /simple/{package}/ resource ---
+  PackageResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ParentId: !Ref SimpleResource
+      PathPart: "{package}"
+
+  # GET /simple/{package}/  →  S3 simple/{package}/index.html
+  PackageGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ResourceId: !Ref PackageResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.package: true
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Content-Type: true
+        - StatusCode: "404"
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: GET
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${PyPIBucket}/simple/{package}/index.html"
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        RequestParameters:
+          integration.request.path.package: method.request.path.package
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Content-Type: "'text/html'"
+          - StatusCode: "404"
+            SelectionPattern: "404"
+        PassthroughBehavior: WHEN_NO_MATCH
+
+  # --- /simple/{package}/{file} resource ---
+  FileResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ParentId: !Ref PackageResource
+      PathPart: "{file}"
+
+  # GET /simple/{package}/{file}  →  S3 packages/{package}/{file}
+  FileGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ResourceId: !Ref FileResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.package: true
+        method.request.path.file: true
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Content-Type: true
+        - StatusCode: "404"
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: GET
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${PyPIBucket}/packages/{package}/{file}"
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        RequestParameters:
+          integration.request.path.package: method.request.path.package
+          integration.request.path.file: method.request.path.file
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Content-Type: integration.response.header.Content-Type
+          - StatusCode: "404"
+            SelectionPattern: "404"
+        PassthroughBehavior: WHEN_NO_MATCH
+        ContentHandling: CONVERT_TO_BINARY
+
+  # ---------------------------------------------------------------
+  # API Gateway Deployment & Stage
+  # ---------------------------------------------------------------
+  PyPIApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SimpleGetMethod
+      - PackageGetMethod
+      - FileGetMethod
+    Properties:
+      RestApiId: !Ref PyPIApi
+
+  PyPIApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref PyPIApi
+      DeploymentId: !Ref PyPIApiDeployment
+      StageName: prod
+
+  # ---------------------------------------------------------------
+  # CloudFront Distribution
+  # ---------------------------------------------------------------
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-cdn"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${StackNamePrefix} PyPI CDN"
+        Aliases:
+          !If
+            - HasCustomDomain
+            - - !Ref DomainName
+            - !Ref "AWS::NoValue"
+        DefaultCacheBehavior:
+          TargetOriginId: ApiGatewayOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Headers:
+              - Host
+          DefaultTTL: !Ref CacheTTL
+          MinTTL: 0
+          MaxTTL: 86400
+        Origins:
+          - Id: ApiGatewayOrigin
+            DomainName: !Sub "${PyPIApi}.execute-api.${AWS::Region}.amazonaws.com"
+            OriginPath: /prod
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols:
+                - TLSv1.2
+        ViewerCertificate:
+          !If
+            - HasCustomDomain
+            - AcmCertificateArn: !Ref AcmCertificateArn
+              SslSupportMethod: sni-only
+              MinimumProtocolVersion: TLSv1.2_2021
+            - CloudFrontDefaultCertificate: true
+              MinimumProtocolVersion: TLSv1.2_2021
+        HttpVersion: http2
+
+Outputs:
+  PyPIEndpoint:
+    Description: Endpoint domain name for pip --index-url
+    Value: !If
+      - HasCustomDomain
+      - !Ref DomainName
+      - !GetAtt CloudFrontDistribution.DomainName
+  BucketName:
+    Description: S3 bucket name for the --bucket CLI flag
+    Value: !Ref PyPIBucket
