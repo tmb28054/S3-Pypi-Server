@@ -1,0 +1,1215 @@
+# yamllint disable rule:line-length
+# yamllint disable rule:document-start
+# yamllint disable rule:truthy
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Private PyPI server using S3 for storage, API Gateway as the HTTP front-end,
+  and CloudFront as a caching layer. Supports optional KMS encryption,
+  API Gateway authorizer (LDAP/AD + API keys), and VPC placement.
+
+Parameters:
+  StackNamePrefix:
+    Type: String
+    Default: s3-pypi
+    Description: Prefix used for naming resources in this stack.
+  CacheTTL:
+    Type: Number
+    Default: 300
+    Description: CloudFront default cache TTL in seconds.
+  DomainName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional custom domain name for CloudFront (e.g. pypi.example.org).
+      Leave empty to use the default CloudFront domain.
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional ACM certificate ARN for the custom domain.
+      Required when DomainName is provided.
+  EnableKMSEncryption:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      When true, creates a Customer Managed KMS key and encrypts all
+      resources at rest (S3, DynamoDB, CloudWatch Logs).
+  EnableAuthorizer:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      When true, adds a Lambda authorizer to the API Gateway supporting
+      LDAP/AD (Basic Auth) and DynamoDB API key (Bearer token) authentication.
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional comma-separated list of subnet IDs for Lambda VPC placement.
+      Both SubnetIds and VpcId must be provided to enable VPC support.
+  VpcId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional VPC ID for Lambda VPC placement.
+      Both SubnetIds and VpcId must be provided to enable VPC support.
+
+Conditions:
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref DomainName, ""]]
+    - !Not [!Equals [!Ref AcmCertificateArn, ""]]
+  KMSEnabled: !Equals [!Ref EnableKMSEncryption, "true"]
+  AuthorizerEnabled: !Equals [!Ref EnableAuthorizer, "true"]
+  VPCEnabled: !And
+    - !Not [!Equals [!Ref VpcId, ""]]
+    - !Not [!Equals [!Select [0, !Ref SubnetIds], ""]]
+
+Resources:
+  # ---------------------------------------------------------------
+  # KMS Key — optional Customer Managed Key for encryption at rest
+  # ---------------------------------------------------------------
+  PyPIKMSKey:
+    Type: AWS::KMS::Key
+    Condition: KMSEnabled
+    Properties:
+      Description: !Sub "${StackNamePrefix} PyPI encryption key"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: CloudWatchLogsAccess
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-kms-key"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+
+  PyPIKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: KMSEnabled
+    Properties:
+      AliasName: !Sub "alias/${StackNamePrefix}-pypi-key"
+      TargetKeyId: !Ref PyPIKMSKey
+
+  # ---------------------------------------------------------------
+  # S3 Bucket — package storage
+  # ---------------------------------------------------------------
+  PyPIBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: !If
+              - KMSEnabled
+              - SSEAlgorithm: "aws:kms"
+                KMSMasterKeyID: !GetAtt PyPIKMSKey.Arn
+              - SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-pypi-bucket"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+
+  # ---------------------------------------------------------------
+  # IAM Role — allows API Gateway to read from the S3 bucket
+  # ---------------------------------------------------------------
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-api-role"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${PyPIBucket}/*"
+
+  # ---------------------------------------------------------------
+  # DynamoDB Table — API key storage (conditional)
+  # ---------------------------------------------------------------
+  APIKeyTable:
+    Type: AWS::DynamoDB::Table
+    Condition: AuthorizerEnabled
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: api_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: api_key
+          KeyType: HASH
+      SSESpecification: !If
+        - KMSEnabled
+        - SSEEnabled: true
+          SSEType: KMS
+          KMSMasterKeyId: !GetAtt PyPIKMSKey.Arn
+        - SSEEnabled: true
+          SSEType: KMS
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-api-keys"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+
+  # ---------------------------------------------------------------
+  # Secrets Manager — LDAP configuration (conditional)
+  # ---------------------------------------------------------------
+  LDAPSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: AuthorizerEnabled
+    Properties:
+      Name: !Sub "${StackNamePrefix}-ldap-config"
+      Description: LDAP/AD connection configuration for PyPI authorizer
+      KmsKeyId: !If
+        - KMSEnabled
+        - !GetAtt PyPIKMSKey.Arn
+        - !Ref "AWS::NoValue"
+      SecretString: '{"host":"","bind_user":"","bind_password":"","entitlement_group":"","write_entitlement_group":""}'
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-ldap-secret"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+
+  # ---------------------------------------------------------------
+  # VPC Security Group — for Lambda functions (conditional)
+  # ---------------------------------------------------------------
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: VPCEnabled
+    Properties:
+      GroupDescription: !Sub "${StackNamePrefix} Lambda security group"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-lambda-sg"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+
+  # ---------------------------------------------------------------
+  # Authorizer Lambda — execution role (conditional)
+  # ---------------------------------------------------------------
+  AuthorizerLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: AuthorizerEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-authorizer-role"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+      Policies:
+        - PolicyName: AuthorizerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref LDAPSecret
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !GetAtt APIKeyTable.Arn
+        - !If
+          - VPCEnabled
+          - PolicyName: VPCAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DeleteNetworkInterface
+                  Resource: "*"
+          - !Ref "AWS::NoValue"
+
+  # ---------------------------------------------------------------
+  # Authorizer Lambda Function (conditional)
+  # ---------------------------------------------------------------
+  AuthorizerLambda:
+    Type: AWS::Lambda::Function
+    Condition: AuthorizerEnabled
+    Properties:
+      FunctionName: !Sub "${StackNamePrefix}-authorizer"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt AuthorizerLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      VpcConfig: !If
+        - VPCEnabled
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+        - !Ref "AWS::NoValue"
+      Environment:
+        Variables:
+          LDAP_SECRET_ARN: !Ref LDAPSecret
+          API_KEY_TABLE_NAME: !Ref APIKeyTable
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-authorizer"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+      Code:
+        ZipFile: |
+          """API Gateway Lambda Authorizer supporting __token__ API keys and LDAP/AD Basic Auth."""
+          import base64
+          import json
+          import logging
+          import os
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          secrets_client = boto3.client("secretsmanager")
+          dynamodb_client = boto3.client("dynamodb")
+
+          API_KEY_TABLE = os.environ["API_KEY_TABLE_NAME"]
+          LDAP_SECRET_ARN = os.environ["LDAP_SECRET_ARN"]
+
+
+          def handler(event, context):
+              """Authorize the request using Basic Auth (__token__ or LDAP)."""
+              auth_header = event.get("headers", {}).get("Authorization", "")
+              method_arn = event.get("methodArn", "")
+
+              logger.info("Authorizer invoked: method_arn=%s", method_arn)
+
+              if not auth_header.startswith("Basic "):
+                  policy = _deny_policy(method_arn)
+                  logger.info("No Basic auth header, denying. Policy: %s", json.dumps(policy))
+                  return policy
+
+              encoded = auth_header[6:].strip()
+              try:
+                  decoded = base64.b64decode(encoded).decode("utf-8")
+                  username, password = decoded.split(":", 1)
+              except Exception as exc:
+                  logger.error("Failed to decode Basic auth: %s", exc)
+                  policy = _deny_policy(method_arn)
+                  logger.info("Decode failed, denying. Policy: %s", json.dumps(policy))
+                  return policy
+
+              logger.info("Auth request: username=%s, method_arn=%s", username, method_arn)
+
+              # __token__ username means API key auth
+              if username == "__token__":
+                  policy = _check_api_key(password, method_arn)
+              else:
+                  # Otherwise, LDAP/AD auth
+                  policy = _check_ldap(username, password, method_arn)
+
+              logger.info("Generated policy: %s", json.dumps(policy))
+              return policy
+
+
+          def _check_api_key(token, method_arn):
+              """Look up the token in DynamoDB and check access level."""
+              try:
+                  response = dynamodb_client.get_item(
+                      TableName=API_KEY_TABLE,
+                      Key={"api_key": {"S": token}},
+                  )
+                  if "Item" not in response:
+                      return _deny_policy(method_arn)
+
+                  item = response["Item"]
+                  access = item.get("access", {}).get("S", "read")
+
+                  if access in ("read/write", "write", "readwrite", "rw"):
+                      return _allow_policy_all(method_arn)
+                  return _allow_policy_read(method_arn)
+              except Exception as exc:
+                  logger.error("DynamoDB lookup failed: %s", exc)
+                  return _deny_policy(method_arn)
+
+
+          def _check_ldap(username, password, method_arn):
+              """Authenticate against LDAP/AD using credentials from Secrets Manager."""
+              try:
+                  secret_response = secrets_client.get_secret_value(SecretId=LDAP_SECRET_ARN)
+                  secret = json.loads(secret_response["SecretString"])
+                  host = secret["host"]
+                  entitlement_group = secret["entitlement_group"]
+                  write_entitlement_group = secret.get("write_entitlement_group", "")
+
+                  if not host:
+                      logger.error("LDAP host not configured")
+                      return _deny_policy(method_arn)
+
+                  import ldap3
+                  server = ldap3.Server(host, use_ssl=True)
+                  conn = ldap3.Connection(server, user=username, password=password)
+                  if not conn.bind():
+                      logger.info("LDAP bind failed for user: %s", username)
+                      return _deny_policy(method_arn)
+
+                  # Check write group membership first
+                  if write_entitlement_group:
+                      conn.search(
+                          search_base=write_entitlement_group,
+                          search_filter=f"(member={username})",
+                          search_scope=ldap3.SUBTREE,
+                      )
+                      if conn.entries:
+                          return _allow_policy_all(method_arn)
+
+                  # Check read group membership
+                  conn.search(
+                      search_base=entitlement_group,
+                      search_filter=f"(member={username})",
+                      search_scope=ldap3.SUBTREE,
+                  )
+                  if conn.entries:
+                      return _allow_policy_read(method_arn)
+
+                  logger.info("User %s not in any entitlement group", username)
+                  return _deny_policy(method_arn)
+              except Exception as exc:
+                  logger.error("LDAP auth failed: %s", exc)
+                  return _deny_policy(method_arn)
+
+
+          def _get_api_arn(method_arn):
+              """Extract the base API ARN for wildcard resource policies."""
+              # method_arn format: arn:aws:execute-api:region:account:api-id/stage/METHOD/resource
+              parts = method_arn.split(":")
+              api_gateway_arn = ":".join(parts[:5])
+              rest = parts[5]
+              api_id_stage = "/".join(rest.split("/")[:2])
+              return f"{api_gateway_arn}:{api_id_stage}"
+
+
+          def _allow_policy_all(method_arn):
+              """Return an IAM Allow policy for all methods (read + write)."""
+              base = _get_api_arn(method_arn)
+              return {
+                  "principalId": "user",
+                  "policyDocument": {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Action": "execute-api:Invoke",
+                              "Effect": "Allow",
+                              "Resource": [
+                                  f"{base}/GET/*",
+                                  f"{base}/POST/*",
+                              ],
+                          }
+                      ],
+                  },
+              }
+
+
+          def _allow_policy_read(method_arn):
+              """Return an IAM Allow policy for GET methods only."""
+              base = _get_api_arn(method_arn)
+              return {
+                  "principalId": "user",
+                  "policyDocument": {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Action": "execute-api:Invoke",
+                              "Effect": "Allow",
+                              "Resource": f"{base}/GET/*",
+                          }
+                      ],
+                  },
+              }
+
+
+          def _deny_policy(method_arn):
+              """Return an IAM Deny policy."""
+              return {
+                  "principalId": "user",
+                  "policyDocument": {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Action": "execute-api:Invoke",
+                              "Effect": "Deny",
+                              "Resource": method_arn,
+                          }
+                      ],
+                  },
+              }
+
+  # ---------------------------------------------------------------
+  # Authorizer Lambda LogGroup (conditional)
+  # ---------------------------------------------------------------
+  AuthorizerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: AuthorizerEnabled
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StackNamePrefix}-authorizer"
+      RetentionInDays: 30
+      KmsKeyId: !If
+        - KMSEnabled
+        - !GetAtt PyPIKMSKey.Arn
+        - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-authorizer-log"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+
+  # ---------------------------------------------------------------
+  # Lambda Permission — allow API Gateway to invoke authorizer
+  # ---------------------------------------------------------------
+  AuthorizerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: AuthorizerEnabled
+    Properties:
+      FunctionName: !GetAtt AuthorizerLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PyPIApi}/*"
+
+  # ---------------------------------------------------------------
+  # Upload Lambda — handles twine-compatible POST uploads (conditional)
+  # ---------------------------------------------------------------
+  UploadLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: AuthorizerEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-upload-role"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+      Policies:
+        - PolicyName: UploadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${PyPIBucket}"
+                  - !Sub "arn:aws:s3:::${PyPIBucket}/*"
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource: "*"
+        - !If
+          - VPCEnabled
+          - PolicyName: VPCAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DeleteNetworkInterface
+                  Resource: "*"
+          - !Ref "AWS::NoValue"
+
+  UploadLambda:
+    Type: AWS::Lambda::Function
+    Condition: AuthorizerEnabled
+    Properties:
+      FunctionName: !Sub "${StackNamePrefix}-upload"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt UploadLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      VpcConfig: !If
+        - VPCEnabled
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+        - !Ref "AWS::NoValue"
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref PyPIBucket
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-upload"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+      Code:
+        ZipFile: |
+          """Upload Lambda handling twine-compatible POST requests."""
+          import base64
+          import cgi
+          import io
+          import json
+          import logging
+          import os
+          import re
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          s3_client = boto3.client("s3")
+          BUCKET = os.environ["BUCKET_NAME"]
+
+
+          def handler(event, context):
+              """Handle POST upload from twine."""
+              try:
+                  content_type = event.get("headers", {}).get("Content-Type", "")
+                  if not content_type:
+                      content_type = event.get("headers", {}).get("content-type", "")
+
+                  body = event.get("body", "")
+                  if event.get("isBase64Encoded", False):
+                      body = base64.b64decode(body)
+                  else:
+                      body = body.encode("utf-8") if isinstance(body, str) else body
+
+                  # Parse multipart form data
+                  environ = {
+                      "REQUEST_METHOD": "POST",
+                      "CONTENT_TYPE": content_type,
+                      "CONTENT_LENGTH": str(len(body)),
+                  }
+                  fs = cgi.FieldStorage(
+                      fp=io.BytesIO(body),
+                      environ=environ,
+                      keep_blank_values=True,
+                  )
+
+                  # Extract the file
+                  file_item = fs["content"]
+                  if not file_item.filename:
+                      return _response(400, "No file provided")
+
+                  filename = file_item.filename
+                  file_data = file_item.file.read()
+
+                  # Normalize package name from filename
+                  name = _extract_package_name(filename)
+                  if not name:
+                      return _response(400, f"Cannot parse package name from: {filename}")
+
+                  normalized = _normalize_name(name)
+
+                  # Upload file to S3
+                  s3_key = f"packages/{normalized}/{filename}"
+                  s3_client.put_object(Bucket=BUCKET, Key=s3_key, Body=file_data)
+
+                  # Regenerate detail page
+                  _regenerate_detail_page(normalized)
+
+                  # Regenerate root index
+                  _regenerate_index_page()
+
+                  logger.info("Uploaded %s to %s", filename, s3_key)
+                  return _response(200, "Upload successful")
+
+              except KeyError:
+                  return _response(400, "Missing 'content' field in upload")
+              except Exception as exc:
+                  logger.error("Upload failed: %s", exc)
+                  return _response(500, f"Internal error: {exc}")
+
+
+          def _normalize_name(name):
+              """Normalize package name per PEP 503."""
+              return re.sub(r"[-_.]+", "-", name).lower()
+
+
+          def _extract_package_name(filename):
+              """Extract package name from a wheel or sdist filename."""
+              if filename.endswith(".whl"):
+                  parts = filename.split("-")
+                  return parts[0] if parts else None
+              if filename.endswith(".tar.gz"):
+                  base = filename[:-7]
+                  parts = base.rsplit("-", 1)
+                  return parts[0] if len(parts) == 2 else None
+              return None
+
+
+          def _regenerate_detail_page(normalized_name):
+              """Regenerate the detail page for a package."""
+              prefix = f"packages/{normalized_name}/"
+              response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+              files = []
+              for obj in response.get("Contents", []):
+                  key = obj["Key"]
+                  fname = key.split("/")[-1]
+                  if fname:
+                      files.append(fname)
+
+              html = _generate_detail_html(normalized_name, files)
+              s3_client.put_object(
+                  Bucket=BUCKET,
+                  Key=f"simple/{normalized_name}/index.html",
+                  Body=html.encode("utf-8"),
+                  ContentType="text/html",
+              )
+
+
+          def _regenerate_index_page():
+              """Regenerate the root index page."""
+              response = s3_client.list_objects_v2(
+                  Bucket=BUCKET, Prefix="packages/", Delimiter="/"
+              )
+              packages = []
+              for prefix in response.get("CommonPrefixes", []):
+                  name = prefix["Prefix"].split("/")[1]
+                  if name:
+                      packages.append(name)
+
+              html = _generate_index_html(packages)
+              s3_client.put_object(
+                  Bucket=BUCKET,
+                  Key="simple/index.html",
+                  Body=html.encode("utf-8"),
+                  ContentType="text/html",
+              )
+
+
+          def _generate_index_html(packages):
+              """Generate PEP 503 root index HTML."""
+              links = "\n".join(
+                  f'<a href="{p}/">{p}</a>' for p in sorted(packages)
+              )
+              return (
+                  "<!DOCTYPE html>\n<html><head>"
+                  '<meta name="pypi:repository-version" content="1.0">'
+                  "</head><body>\n" + links + "\n</body></html>"
+              )
+
+
+          def _generate_detail_html(name, files):
+              """Generate PEP 503 detail page HTML."""
+              links = "\n".join(
+                  f'<a href="../../packages/{name}/{f}">{f}</a>' for f in sorted(files)
+              )
+              return (
+                  "<!DOCTYPE html>\n<html><head>"
+                  '<meta name="pypi:repository-version" content="1.0">'
+                  "</head><body>\n" + links + "\n</body></html>"
+              )
+
+
+          def _response(status_code, message):
+              """Return an API Gateway proxy response."""
+              return {
+                  "statusCode": status_code,
+                  "headers": {"Content-Type": "text/plain"},
+                  "body": message,
+              }
+
+  UploadLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: AuthorizerEnabled
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StackNamePrefix}-upload"
+      RetentionInDays: 30
+      KmsKeyId: !If
+        - KMSEnabled
+        - !GetAtt PyPIKMSKey.Arn
+        - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-upload-log"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+
+  UploadLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: AuthorizerEnabled
+    Properties:
+      FunctionName: !GetAtt UploadLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PyPIApi}/*"
+
+  # ---------------------------------------------------------------
+  # API Gateway — REST API
+  # ---------------------------------------------------------------
+  PyPIApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${StackNamePrefix}-api"
+      Description: PyPI Simple Repository API backed by S3
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-api"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+      BinaryMediaTypes:
+        - "application/octet-stream"
+        - "application/zip"
+        - "application/gzip"
+        - "application/x-tar"
+        - "application/x-gzip"
+        - "multipart/form-data"
+
+  # ---------------------------------------------------------------
+  # API Gateway Authorizer (conditional)
+  # ---------------------------------------------------------------
+  PyPIAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Condition: AuthorizerEnabled
+    Properties:
+      Name: !Sub "${StackNamePrefix}-authorizer"
+      RestApiId: !Ref PyPIApi
+      Type: REQUEST
+      AuthorizerUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerLambda.Arn}/invocations"
+      IdentitySource: method.request.header.Authorization
+      AuthorizerResultTtlInSeconds: 0
+
+  # --- /simple/ resource ---
+  SimpleResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ParentId: !GetAtt PyPIApi.RootResourceId
+      PathPart: simple
+
+  # GET /simple/  →  S3 simple/index.html
+  SimpleGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ResourceId: !Ref SimpleResource
+      HttpMethod: GET
+      AuthorizationType: !If
+        - AuthorizerEnabled
+        - CUSTOM
+        - NONE
+      AuthorizerId: !If
+        - AuthorizerEnabled
+        - !Ref PyPIAuthorizer
+        - !Ref "AWS::NoValue"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Content-Type: true
+        - StatusCode: "404"
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: GET
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${PyPIBucket}/simple/index.html"
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Content-Type: "'text/html'"
+          - StatusCode: "404"
+            SelectionPattern: "404"
+        PassthroughBehavior: WHEN_NO_MATCH
+
+  # POST /simple/  →  Upload Lambda (twine upload)
+  SimplePostMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: AuthorizerEnabled
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ResourceId: !Ref SimpleResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref PyPIAuthorizer
+      MethodResponses:
+        - StatusCode: "200"
+        - StatusCode: "400"
+        - StatusCode: "500"
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadLambda.Arn}/invocations"
+
+  # --- /simple/{package}/ resource ---
+  PackageResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ParentId: !Ref SimpleResource
+      PathPart: "{package}"
+
+  # GET /simple/{package}/  →  S3 simple/{package}/index.html
+  PackageGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ResourceId: !Ref PackageResource
+      HttpMethod: GET
+      AuthorizationType: !If
+        - AuthorizerEnabled
+        - CUSTOM
+        - NONE
+      AuthorizerId: !If
+        - AuthorizerEnabled
+        - !Ref PyPIAuthorizer
+        - !Ref "AWS::NoValue"
+      RequestParameters:
+        method.request.path.package: true
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Content-Type: true
+        - StatusCode: "404"
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: GET
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${PyPIBucket}/simple/{package}/index.html"
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        RequestParameters:
+          integration.request.path.package: method.request.path.package
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Content-Type: "'text/html'"
+          - StatusCode: "404"
+            SelectionPattern: "404"
+        PassthroughBehavior: WHEN_NO_MATCH
+
+  # --- /simple/{package}/{file} resource ---
+  FileResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ParentId: !Ref PackageResource
+      PathPart: "{file}"
+
+  # GET /simple/{package}/{file}  →  S3 packages/{package}/{file}
+  FileGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PyPIApi
+      ResourceId: !Ref FileResource
+      HttpMethod: GET
+      AuthorizationType: !If
+        - AuthorizerEnabled
+        - CUSTOM
+        - NONE
+      AuthorizerId: !If
+        - AuthorizerEnabled
+        - !Ref PyPIAuthorizer
+        - !Ref "AWS::NoValue"
+      RequestParameters:
+        method.request.path.package: true
+        method.request.path.file: true
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Content-Type: true
+        - StatusCode: "404"
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: GET
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${PyPIBucket}/packages/{package}/{file}"
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        RequestParameters:
+          integration.request.path.package: method.request.path.package
+          integration.request.path.file: method.request.path.file
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Content-Type: integration.response.header.Content-Type
+          - StatusCode: "404"
+            SelectionPattern: "404"
+        PassthroughBehavior: WHEN_NO_MATCH
+        ContentHandling: CONVERT_TO_BINARY
+
+  # ---------------------------------------------------------------
+  # API Gateway Deployment & Stage
+  # ---------------------------------------------------------------
+  PyPIApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SimpleGetMethod
+      - PackageGetMethod
+      - FileGetMethod
+    Properties:
+      RestApiId: !Ref PyPIApi
+
+  # Second deployment that includes the POST method (conditional)
+  PyPIApiDeploymentWithPost:
+    Type: AWS::ApiGateway::Deployment
+    Condition: AuthorizerEnabled
+    DependsOn:
+      - SimpleGetMethod
+      - PackageGetMethod
+      - FileGetMethod
+      - SimplePostMethod
+    Properties:
+      RestApiId: !Ref PyPIApi
+
+  # ---------------------------------------------------------------
+  # API Gateway CloudWatch Logs Role — required for access logging
+  # ---------------------------------------------------------------
+  ApiGatewayLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-apigw-logs-role"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    DependsOn: PyPIApi
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayLogsRole.Arn
+
+  # ---------------------------------------------------------------
+  # API Gateway Access Log Group
+  # ---------------------------------------------------------------
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${StackNamePrefix}-access-logs"
+      RetentionInDays: 30
+      KmsKeyId: !If
+        - KMSEnabled
+        - !GetAtt PyPIKMSKey.Arn
+        - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-apigw-log"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+
+  PyPIApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: ApiGatewayAccount
+    Properties:
+      RestApiId: !Ref PyPIApi
+      DeploymentId: !If
+        - AuthorizerEnabled
+        - !Ref PyPIApiDeploymentWithPost
+        - !Ref PyPIApiDeployment
+      StageName: prod
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLength":"$context.responseLength"}'
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-api-stage"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+
+  # ---------------------------------------------------------------
+  # CloudFront Distribution
+  # ---------------------------------------------------------------
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackNamePrefix}-cdn"
+        - Key: Environment
+          Value: prod
+        - Key: Project
+          Value: !Ref StackNamePrefix
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${StackNamePrefix} PyPI CDN"
+        Aliases:
+          !If
+          - HasCustomDomain
+          - - !Ref DomainName
+          - !Ref "AWS::NoValue"
+        DefaultCacheBehavior:
+          TargetOriginId: ApiGatewayOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: true
+            Headers:
+              - Host
+              - Authorization
+              - Content-Type
+              - Content-Length
+          DefaultTTL: !Ref CacheTTL
+          MinTTL: 0
+          MaxTTL: 86400
+        Origins:
+          - Id: ApiGatewayOrigin
+            DomainName: !Sub "${PyPIApi}.execute-api.${AWS::Region}.amazonaws.com"
+            OriginPath: /prod
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols:
+                - TLSv1.2
+        ViewerCertificate:
+          !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+            MinimumProtocolVersion: TLSv1.2_2021
+        HttpVersion: http2
+
+Outputs:
+  PyPIEndpoint:
+    Description: Endpoint domain name for pip --index-url
+    Value: !If
+      - HasCustomDomain
+      - !Ref DomainName
+      - !GetAtt CloudFrontDistribution.DomainName
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID for cache invalidation
+    Value: !Ref CloudFrontDistribution
+  CloudFrontURL:
+    Description: Full CloudFront URL for pip --index-url
+    Value: !If
+      - HasCustomDomain
+      - !Sub "https://${DomainName}/simple/"
+      - !Sub "https://${CloudFrontDistribution.DomainName}/simple/"
+  ApiGatewayURL:
+    Description: Direct API Gateway URL (bypasses CloudFront cache)
+    Value: !Sub "https://${PyPIApi}.execute-api.${AWS::Region}.amazonaws.com/prod/simple/"
+  BucketName:
+    Description: S3 bucket name for the --bucket CLI flag
+    Value: !Ref PyPIBucket
+  KMSKeyArn:
+    Condition: KMSEnabled
+    Description: ARN of the Customer Managed KMS key
+    Value: !GetAtt PyPIKMSKey.Arn
+  LDAPSecretArn:
+    Condition: AuthorizerEnabled
+    Description: ARN of the LDAP configuration secret
+    Value: !Ref LDAPSecret
+  APIKeyTableName:
+    Condition: AuthorizerEnabled
+    Description: Name of the DynamoDB API key table
+    Value: !Ref APIKeyTable

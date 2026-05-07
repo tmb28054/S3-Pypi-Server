@@ -13,6 +13,7 @@ description = "A private PyPI server backed by AWS S3, API Gateway, and CloudFro
 requires-python = ">=3.10"
 dependencies = [
     "boto3",
+    "keyring",
 ]
 
 [project.urls]
@@ -31,6 +32,9 @@ test = [
 
 [project.scripts]
 s3pypi = "s3pypi.cli:main"
+
+[tool.setuptools.package-data]
+s3pypi = ["template.yaml"]
 
 [tool.pytest.ini_options]
 markers = [
