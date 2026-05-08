@@ -8,7 +8,7 @@ from s3pypi.index import generate_detail_page, generate_index_page
 from s3pypi.packaging import normalize_name, parse_distribution_filename
 
 
-class S3PyPIUploader:  # pylint: disable=too-few-public-methods
+class S3PyPIUploader:
     """Orchestrates package upload and index regeneration."""
 
     def __init__(self, bucket: str, s3_client=None):

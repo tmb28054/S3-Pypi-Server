@@ -37,19 +37,28 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/tmb28054/S3-Pypi-Server"
 Repository = "https://github.com/tmb28054/S3-Pypi-Server"
+Documentation = "https://github.com/tmb28054/S3-Pypi-Server/tree/main/docs"
+Changelog = "https://github.com/tmb28054/S3-Pypi-Server/blob/main/CHANGELOG.md"
+Issues = "https://github.com/tmb28054/S3-Pypi-Server/issues"
 
 [project.optional-dependencies]
 test = [
     "pytest",
     "pytest-cov",
     "hypothesis",
-    "moto",
+    "moto[all]",
     "pylint",
     "bandit",
+    "cfn-lint",
+    "yamllint",
 ]
 
 [project.scripts]
 s3pypi = "s3pypi.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["s3pypi*"]
+exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 s3pypi = ["template.yaml"]
@@ -58,3 +67,26 @@ s3pypi = ["template.yaml"]
 markers = [
     "smoke: fast smoke tests with no external dependencies",
 ]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["s3pypi"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.",
+]
+
+[tool.pylint.main]
+max-line-length = 120
+
+[tool.pylint."messages control"]
+disable = [
+    "too-few-public-methods",
+]
+
+[tool.bandit]
+exclude_dirs = ["tests"]
