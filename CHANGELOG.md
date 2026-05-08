@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-08
+
+### Fixed
+
+- Authorizer now accepts `write`, `readwrite`, and `rw` as write access levels in addition to `read/write`.
+- Twine uploads use the API Gateway URL directly (bypasses CloudFront POST restrictions).
+- CloudFront forwards POST methods and Authorization/Content-Type headers for upload support.
+- API Gateway deployment now correctly includes POST method when authorizer is enabled.
+- Authorizer cache disabled (TTL=0) to prevent stale read-only policies blocking POST requests.
+- Authorizer logs the generated policy for debugging.
+
+### Added
+
+- `s3pypi configure --from-stack` to import configuration from stack outputs.
+- `s3pypi deploy --update` for interactive stack parameter updates.
+- `s3pypi pip` and `s3pypi twine` subcommands with keyring credential storage.
+- `--save` option on `pip` and `twine` subcommands to write config files directly.
+- `CloudFrontDistributionId`, `CloudFrontURL`, and `ApiGatewayURL` stack outputs.
+- Smoke tests for cfn-lint and yamllint.
+- `keyring` as a runtime dependency.
+- Complete `pyproject.toml` tooling configuration (coverage, pylint, bandit).
+
 ## [0.3.0] - 2026-05-08
 
 ### Added
